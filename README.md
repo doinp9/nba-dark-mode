@@ -2,6 +2,8 @@
 
 A clean, carefully crafted dark theme for NBA.com — built as a Chrome extension.
 
+[![NBA Dark Mode Screenshot](screenshots/stats-page.png)](screenshots/stats-page.png)
+
 ## Features
 
 * **True dark backgrounds** — not a cheap `invert()` filter, but proper dark shades with visual hierarchy
