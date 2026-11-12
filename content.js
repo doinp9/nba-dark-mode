@@ -42,7 +42,10 @@
     blockquote, pre, code, small, strong, em, b, i, u,
     button, input, select, textarea, option {
       color: ${COLORS.text} !important;
-      border-color: ${COLORS.border} !important;
+      /* NOTE: no global border-color here. Forcing border-color on every
+         div/span repaints the transparent sides of CSS border-triangles
+         (e.g. the scoreboard winner arrow) into grey squares. Light
+         borders are darkened per-element by the JS scanner instead. */
     }
 
     /* ===== LINKS ===== */
@@ -90,13 +93,19 @@
       color: ${COLORS.textMuted} !important;
       font-weight: 600 !important;
     }
-    tbody tr:nth-child(odd) {
+    /* Rows AND cells: NBA.com can paint the stripe on the <td> (or on a
+       layer behind it), which shows through a <tr>-only override as
+       white rows with light text. Painting the cells covers every case. */
+    tbody tr:nth-child(odd),
+    tbody tr:nth-child(odd) > td {
       background-color: ${COLORS.evenRow} !important;
     }
-    tbody tr:nth-child(even) {
+    tbody tr:nth-child(even),
+    tbody tr:nth-child(even) > td {
       background-color: ${COLORS.pageBg} !important;
     }
-    tbody tr:hover {
+    tbody tr:hover,
+    tbody tr:hover > td {
       background-color: ${COLORS.hoverBg} !important;
     }
     td, th {
@@ -111,17 +120,19 @@
       background-color: ${COLORS.pageBg} !important;
     }
 
-    /* ===== BUTTONS ===== */
-    button, [role="button"], .btn,
-    [class*="Button"],
-    [class*="button_"],
-    input[type="submit"],
-    input[type="button"] {
+    /* ===== BUTTONS =====
+       Not applied inside the natively dark top nav/header — doing so
+       drew grey boxes behind the apps-grid and profile icons. */
+    :is(button, [role="button"], .btn,
+        [class*="Button"],
+        [class*="button_"],
+        input[type="submit"],
+        input[type="button"]):not(header *, nav *) {
       background-color: ${COLORS.elevatedBg} !important;
       color: ${COLORS.text} !important;
       border-color: ${COLORS.borderLight} !important;
     }
-    button:hover, [role="button"]:hover {
+    :is(button, [role="button"]):not(header *, nav *):hover {
       background-color: ${COLORS.hoverBg} !important;
     }
 
@@ -228,11 +239,28 @@
   `;
 
   // ── Inject CSS immediately ─────────────────────────────────
+  // Idempotent: creates the <style> if missing (e.g. removed when the
+  // site re-renders <head>), and keeps it as the LAST child of <head>
+  // so it wins cascade ties against site stylesheets.
   function injectCSS() {
-    const style = document.createElement('style');
-    style.id = 'nba-dark-mode-css';
-    style.textContent = CSS;
-    (document.head || document.documentElement).appendChild(style);
+    let style = document.getElementById('nba-dark-mode-css');
+    if (!style) {
+      style = document.createElement('style');
+      style.id = 'nba-dark-mode-css';
+      style.textContent = CSS;
+    }
+    const parent = document.head || document.documentElement;
+    if (!parent) {
+      // No <html> yet: inject the moment it is created.
+      const mo = new MutationObserver(() => {
+        if (document.documentElement) { mo.disconnect(); if (isActive) injectCSS(); }
+      });
+      mo.observe(document, { childList: true });
+      return;
+    }
+    if (style.parentNode !== parent || parent.lastElementChild !== style) {
+      parent.appendChild(style);
+    }
   }
 
   // ── Remove CSS ─────────────────────────────────────────────
@@ -350,13 +378,40 @@
     return null;
   }
 
+  // Only write when the value actually changes — otherwise every write
+  // fires a style mutation, which would re-trigger the scanner forever.
+  function setImportant(el, prop, value) {
+    if (el.style.getPropertyValue(prop) === value &&
+        el.style.getPropertyPriority(prop) === 'important') return;
+    el.style.setProperty(prop, value, 'important');
+  }
+
+  const BORDER_SIDES = ['top', 'right', 'bottom', 'left'];
+
+  // Darken light borders. Zero-width/height elements are skipped: those
+  // are CSS border-triangles (winner arrow, carets) whose coloured side
+  // IS the visible shape and must stay untouched.
+  function fixBorders(el, computed) {
+    if (computed.width === '0px' || computed.height === '0px') return;
+    for (const side of BORDER_SIDES) {
+      if (parseFloat(computed.getPropertyValue(`border-${side}-width`)) === 0) continue;
+      const c = parseColor(computed.getPropertyValue(`border-${side}-color`));
+      if (c && luminance(c) > 120) {
+        setImportant(el, `border-${side}-color`, COLORS.border);
+      }
+    }
+  }
+
   function scanElements() {
+    if (!isActive) return;
+    injectCSS();
     const all = document.querySelectorAll('*');
     for (const el of all) {
       if (isPreservedElement(el)) continue;
 
       try {
         const computed = getComputedStyle(el);
+        fixBorders(el, computed);
         const bg = computed.backgroundColor;
         if (!bg || bg === 'transparent' || bg === 'rgba(0, 0, 0, 0)') continue;
 
@@ -365,13 +420,13 @@
 
         const replacement = getDarkReplacement(el, color);
         if (replacement) {
-          el.style.setProperty('background-color', replacement, 'important');
+          setImportant(el, 'background-color', replacement);
         }
 
         // Fix text color if it's dark on our dark bg
         const fg = parseColor(computed.color);
         if (fg && luminance(fg) < 80) {
-          el.style.setProperty('color', COLORS.text, 'important');
+          setImportant(el, 'color', COLORS.text);
         }
       } catch (e) {
         // Skip elements that can't be styled
@@ -380,10 +435,22 @@
   }
 
   // ── MutationObserver for SPA navigation ────────────────────
+  // Debounce with a max-wait: NBA.com mutates the DOM almost constantly
+  // (ads, live scores, video). A pure 150ms debounce got reset forever
+  // and the scan never ran — the "sometimes it works" behaviour.
+  const SCAN_DELAY = 150;
+  const SCAN_MAX_WAIT = 1000;
   let scanTimeout = null;
+  let firstQueuedAt = 0;
   function debouncedScan() {
-    if (scanTimeout) clearTimeout(scanTimeout);
-    scanTimeout = setTimeout(scanElements, 150);
+    const now = Date.now();
+    if (!scanTimeout) firstQueuedAt = now;
+    else clearTimeout(scanTimeout);
+    const wait = Math.max(0, Math.min(SCAN_DELAY, firstQueuedAt + SCAN_MAX_WAIT - now));
+    scanTimeout = setTimeout(() => {
+      scanTimeout = null;
+      scanElements();
+    }, wait);
   }
 
   let observer = null;
@@ -393,12 +460,17 @@
     observer = new MutationObserver((mutations) => {
       let shouldScan = false;
       for (const m of mutations) {
-        if (m.addedNodes.length > 0) { shouldScan = true; break; }
-        if (m.type === 'attributes' && m.attributeName === 'class') { shouldScan = true; break; }
+        if (m.addedNodes.length > 0 || m.removedNodes.length > 0) { shouldScan = true; break; }
+        // 'style' included: React re-renders can wipe the scanner's inline
+        // overrides. setImportant() makes the scanner's own writes no-ops
+        // on the next pass, so this does not loop.
+        if (m.type === 'attributes') { shouldScan = true; break; }
       }
       if (shouldScan) debouncedScan();
     });
-    observer.observe(document.body, {
+    // documentElement (not body) so a removed/reordered <style> in
+    // <head> is also detected and re-injected.
+    observer.observe(document.documentElement, {
       childList: true,
       subtree: true,
       attributes: true,
@@ -449,6 +521,7 @@
     for (const el of all) {
       el.style.removeProperty('background-color');
       el.style.removeProperty('color');
+      for (const side of BORDER_SIDES) el.style.removeProperty(`border-${side}-color`);
     }
   }
 
